@@ -24,6 +24,7 @@ import {
   resolveUIBackendType,
 } from "@/constants/dbProviderConstants";
 import { useGetGlobalVariables } from "@/controllers/API/queries/variables";
+import { useUtilityStore } from "@/stores/utilityStore";
 import type { GlobalVariable } from "@/types/global_variables";
 import { cn } from "@/utils/utils";
 import { focusCommandListOnOpen } from "../../utils/focus-command-list-on-open";
@@ -106,12 +107,21 @@ export function DBProviderInput({
   const refButton = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
 
+  const localVectorStoreAvailable = useUtilityStore(
+    (state) => state.localVectorStoreAvailable,
+  );
+
   const selectedProvider = getDBProviderOption(value);
   const selectedIsConfigured = isDBProviderConfigured(value, globalVariables);
 
   const selectableOptions = useMemo(
     () =>
-      DB_PROVIDER_OPTIONS.map((provider) => ({
+      DB_PROVIDER_OPTIONS.filter(
+        // Local Chroma stores vectors on the serving box's own disk, which the
+        // production profile refuses. Hide it there rather than offering a
+        // choice the create endpoint always rejects with 422.
+        (provider) => localVectorStoreAvailable || provider.id !== "chroma",
+      ).map((provider) => ({
         provider,
         configured:
           provider.status === "available"
@@ -121,7 +131,7 @@ export function DBProviderInput({
               )
             : false,
       })),
-    [globalVariables],
+    [globalVariables, localVectorStoreAvailable],
   );
 
   const handleSelect = (provider: DBProviderOption) => {
