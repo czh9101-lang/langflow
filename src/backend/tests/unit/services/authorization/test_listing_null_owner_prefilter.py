@@ -35,8 +35,9 @@ from langflow.services.database.models.auth import AuthzShare
 from langflow.services.database.models.flow.model import Flow
 from langflow.services.database.models.folder.model import Folder
 from langflow.services.database.models.user.model import User
-from langflow.services.deps import get_auth_service, get_settings_service, session_scope
+from langflow.services.deps import get_auth_service, get_db_service, get_settings_service, session_scope
 from lfx.services.authorization.base import BaseAuthorizationService, ResourceVisibilityScope, TargetedShareSelector
+from sqlalchemy import event
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 from sqlalchemy.sql.sqltypes import NullType
 from sqlmodel import select
@@ -482,11 +483,25 @@ async def test_shared_project_non_paginated_flow_list_evaluates_targeted_shares_
             permission_levels=("read", "write", "execute", "admin"),
         )
     )
-    with _install_prefilter_authz(settings, {}, scope_by_type={"flow": scope}):
-        response_ids = _project_flow_ids(
-            await client.get(f"api/v1/projects/{project_id}", headers=headers),
-            paginated=False,
-        )
+    flow_selects: list[str] = []
+
+    def _capture_flow_select(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("select") and " from flow " in f" {normalized} ":
+            flow_selects.append(normalized)
+
+    sync_engine = get_db_service().engine.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", _capture_flow_select)
+    try:
+        with _install_prefilter_authz(settings, {}, scope_by_type={"flow": scope}):
+            response_ids = _project_flow_ids(
+                await client.get(f"api/v1/projects/{project_id}", headers=headers),
+                paginated=False,
+            )
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", _capture_flow_select)
 
     assert response_ids == {shared_id}
     assert hidden_id not in response_ids
+    assert len(flow_selects) == 1, "targeted project reads must not eager-load every flow before SQL filtering"
+    assert "authz_share" in flow_selects[0]
