@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from lfx.services.authorization.base import ResourceVisibilityScope
+from lfx.services.authorization.base import ResourceVisibilityScope, TargetedShareSelector
 from sqlalchemy import Select, and_, false
-from sqlmodel import col, or_
+from sqlmodel import col, or_, select
 
 from langflow.services.authorization.actions import FlowAction
 from langflow.services.authorization.guards import (
@@ -247,6 +247,49 @@ async def apply_owned_or_visible_prefilter(
     return stmt.where(col(id_column).in_(list(visible_ids)))
 
 
+def _targeted_share_exists_clause(
+    *,
+    id_column: InstrumentedAttribute,
+    selector: TargetedShareSelector | None,
+) -> ColumnElement[bool] | None:
+    """Build a constant-size correlated predicate for direct/active-team shares."""
+    if selector is None or not selector.permission_levels:
+        return None
+
+    # Lazy imports keep the portable authorization contract independent of the
+    # Langflow ORM and avoid authorization/database import cycles at startup.
+    from langflow.services.database.models.auth import AuthzShare, AuthzTeam, AuthzTeamMember
+
+    active_team_membership = (
+        select(1)
+        .select_from(AuthzTeamMember)
+        .join(AuthzTeam, AuthzTeam.id == AuthzTeamMember.team_id)
+        .where(
+            AuthzTeamMember.team_id == AuthzShare.target_id,
+            AuthzTeamMember.user_id == selector.user_id,
+            AuthzTeam.is_active.is_(True),
+        )
+        .correlate(AuthzShare)
+        .exists()
+    )
+    targeted_audience = or_(
+        and_(AuthzShare.scope == "user", AuthzShare.target_id == selector.user_id),
+        and_(AuthzShare.scope == "team", active_team_membership),
+    )
+    return (
+        select(1)
+        .select_from(AuthzShare)
+        .where(
+            AuthzShare.resource_type == selector.resource_type,
+            AuthzShare.resource_id == col(id_column),
+            col(AuthzShare.permission_level).in_(selector.permission_levels),
+            targeted_audience,
+        )
+        .correlate(id_column.class_)
+        .exists()
+    )
+
+
 def restrict_to_owned_or_visible_scope(
     stmt: StatementT,
     *,
@@ -257,7 +300,11 @@ def restrict_to_owned_or_visible_scope(
     workspace_expression: ColumnElement[Any] | None = None,
     project_column: InstrumentedAttribute | None = None,
 ) -> StatementT:
-    """Apply owner, concrete-ID, workspace, and project visibility before pagination."""
+    """Apply owner, share, concrete-ID, workspace, and project visibility before pagination."""
+    targeted_share_clause = _targeted_share_exists_clause(
+        id_column=id_column,
+        selector=visibility.targeted_share,
+    )
     if visibility.all_resources:
         if project_column is None or not visibility.excluded_global_project_ids:
             return stmt
@@ -272,11 +319,15 @@ def restrict_to_owned_or_visible_scope(
         ]
         if visibility.resource_ids:
             global_clauses.append(col(id_column).in_(visibility.resource_ids))
+        if targeted_share_clause is not None:
+            global_clauses.append(targeted_share_clause)
         return stmt.where(or_(*global_clauses))
 
     clauses: list[ColumnElement[bool]] = [owner_clause]
     if visibility.resource_ids:
         clauses.append(col(id_column).in_(visibility.resource_ids))
+    if targeted_share_clause is not None:
+        clauses.append(targeted_share_clause)
     resolved_workspace = workspace_expression
     if resolved_workspace is None and workspace_column is not None:
         resolved_workspace = col(workspace_column)

@@ -10,6 +10,7 @@ from lfx.services.authorization.base import (
     DirectoryMembershipSnapshot,
     ResourceVisibilityScope,
     ShareRuleSnapshot,
+    TargetedShareSelector,
     UserAuthorizationSnapshot,
 )
 from lfx.services.authorization.service import AuthorizationService
@@ -25,5 +26,6 @@ __all__ = [
     "DirectoryMembershipSnapshot",
     "ResourceVisibilityScope",
     "ShareRuleSnapshot",
+    "TargetedShareSelector",
     "UserAuthorizationSnapshot",
 ]

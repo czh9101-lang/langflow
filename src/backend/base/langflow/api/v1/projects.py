@@ -438,21 +438,33 @@ async def read_project(
             # have. OSS pass-through returns the input list unchanged, so this
             # has no effect on default OSS installs.
             if visibility_scope is not None:
-                # Eager-loaded ``project.flows`` constrained to (owned ⊕ visible)
-                # by set membership — the same union as the SQL prefilter, applied
-                # in memory because the relationship is already materialized
-                # (still no per-row enforce, so no N+1).
-                visible_flows = [
-                    flow
-                    for flow in project.flows
-                    if flow.user_id == current_user.id
-                    or resource_visible_in_scope(
-                        resource_id=flow.id,
-                        workspace_id=project.workspace_id,
-                        project_id=flow.folder_id,
+                if visibility_scope.targeted_share is not None:
+                    # A targeted-share selector must be evaluated by the DB;
+                    # evaluating the already-loaded relationship would require
+                    # materializing every shared resource id in the plugin.
+                    stmt = restrict_to_owned_or_visible_scope(
+                        select(Flow).where(Flow.folder_id == project_id),
+                        id_column=Flow.id,
+                        owner_clause=Flow.user_id == current_user.id,
+                        workspace_expression=null() if project.workspace_id is None else literal(project.workspace_id),
+                        project_column=Flow.folder_id,
                         visibility=visibility_scope,
                     )
-                ]
+                    visible_flows = list((await session.exec(stmt)).all())
+                else:
+                    # Other compact scopes can still filter the eager-loaded
+                    # relationship without another query or per-row enforce.
+                    visible_flows = [
+                        flow
+                        for flow in project.flows
+                        if flow.user_id == current_user.id
+                        or resource_visible_in_scope(
+                            resource_id=flow.id,
+                            workspace_id=project.workspace_id,
+                            project_id=flow.folder_id,
+                            visibility=visibility_scope,
+                        )
+                    ]
             else:
                 visible_flows = await filter_visible_resources(
                     current_user,

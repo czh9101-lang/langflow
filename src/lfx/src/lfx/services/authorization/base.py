@@ -169,10 +169,28 @@ class DirectoryMembershipIngestResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetedShareSelector:
+    """Framework-neutral selector for canonical direct and team shares.
+
+    The authorization plugin resolves action semantics into the accepted
+    ``permission_levels``; the Langflow database layer then evaluates the
+    selector against ``authz_share`` without returning or materializing every
+    matching resource UUID. Team targets include only memberships in active
+    teams. An empty permission-level tuple is an inactive selector.
+    """
+
+    user_id: UUID
+    resource_type: str
+    permission_levels: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceVisibilityScope:
     """Compact SQL-prefilter contract for resource-list authorization.
 
-    ``resource_ids`` represents concrete grants such as user/team shares.
+    ``resource_ids`` represents legacy concrete grants. ``targeted_share``
+    represents canonical user/team shares as a database-native selector, so
+    plugins do not need to materialize matching resource UUIDs.
     ``workspace_ids`` and ``project_ids`` represent wildcard role grants at
     those domains without expanding them to every resource UUID. A global
     wildcard is represented by ``all_resources``. Plugins that define a
@@ -194,6 +212,7 @@ class ResourceVisibilityScope:
     include_unassigned_workspace: bool = False
     excluded_workspace_project_ids: tuple[UUID, ...] = ()
     excluded_global_project_ids: tuple[UUID, ...] = ()
+    targeted_share: TargetedShareSelector | None = None
 
     @property
     def has_cross_user_access(self) -> bool:
@@ -204,6 +223,7 @@ class ResourceVisibilityScope:
             or self.workspace_ids
             or self.project_ids
             or self.include_unassigned_workspace
+            or (self.targeted_share is not None and self.targeted_share.permission_levels)
         )
 
 

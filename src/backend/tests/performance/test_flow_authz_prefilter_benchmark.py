@@ -7,6 +7,7 @@ generous wall-clock ceiling so slower CI hosts do not flap.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from statistics import median
 from time import perf_counter
 from uuid import UUID, uuid4
@@ -163,6 +164,7 @@ def test_targeted_share_prefilter_stays_compact_at_ten_thousand_share_rows(tmp_p
     other_user_id = uuid4()
     active_team_id = uuid4()
     inactive_team_id = uuid4()
+    inserted_at = datetime.now(timezone.utc)
 
     flow_rows: list[dict[str, object]] = []
     share_rows: list[dict[str, object]] = []
@@ -187,6 +189,7 @@ def test_targeted_share_prefilter_stays_compact_at_ten_thousand_share_rows(tmp_p
             "scope": "user",
             "target_id": other_user_id,
             "permission_level": "admin",
+            "created_at": inserted_at,
         }
         if index % 100 == 1:
             share.update(target_id=target_user_id, permission_level="write")
@@ -224,20 +227,34 @@ def test_targeted_share_prefilter_stays_compact_at_ten_thousand_share_rows(tmp_p
                     "team_name": "active",
                     "adom_name": "active",
                     "is_active": True,
+                    "created_at": inserted_at,
+                    "updated_at": inserted_at,
                 },
                 {
                     "id": inactive_team_id,
                     "team_name": "inactive",
                     "adom_name": "inactive",
                     "is_active": False,
+                    "created_at": inserted_at,
+                    "updated_at": inserted_at,
                 },
             ],
         )
         connection.execute(
             AuthzTeamMember.__table__.insert(),
             [
-                {"id": uuid4(), "team_id": active_team_id, "user_id": target_user_id},
-                {"id": uuid4(), "team_id": inactive_team_id, "user_id": target_user_id},
+                {
+                    "id": uuid4(),
+                    "team_id": active_team_id,
+                    "user_id": target_user_id,
+                    "created_at": inserted_at,
+                },
+                {
+                    "id": uuid4(),
+                    "team_id": inactive_team_id,
+                    "user_id": target_user_id,
+                    "created_at": inserted_at,
+                },
             ],
         )
         connection.execute(Flow.__table__.insert(), flow_rows)
@@ -260,7 +277,9 @@ def test_targeted_share_prefilter_stays_compact_at_ten_thousand_share_rows(tmp_p
         sql_count = session.exec(select(func.count()).select_from(filtered_stmt.subquery())).one()
         sql_page = session.exec(filtered_stmt.order_by(Flow.name, Flow.id).offset(PAGE_OFFSET).limit(PAGE_SIZE)).all()
 
-    ordered_expected = sorted(expected_ids, key=lambda flow_id: next(row["name"] for row in flow_rows if row["id"] == flow_id))
+    ordered_expected = sorted(
+        expected_ids, key=lambda flow_id: next(row["name"] for row in flow_rows if row["id"] == flow_id)
+    )
     expected_page = ordered_expected[PAGE_OFFSET : PAGE_OFFSET + PAGE_SIZE]
     assert {flow.id for flow in sql_rows} == expected_ids
     assert sql_count == len(expected_ids)
