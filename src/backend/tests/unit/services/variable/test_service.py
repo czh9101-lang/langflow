@@ -7,12 +7,13 @@ import pytest
 from cryptography.fernet import Fernet
 from langflow.services.auth.service import AuthService
 from langflow.services.auth.utils import ensure_fernet_key
+from langflow.services.database.models.auth import AuthzShare
 from langflow.services.database.models.user.model import User
 from langflow.services.database.models.variable.model import VariableUpdate
 from langflow.services.deps import get_settings_service
 from langflow.services.variable.constants import CREDENTIAL_TYPE, GENERIC_TYPE
 from langflow.services.variable.service import DatabaseVariableService
-from lfx.services.authorization.base import ResourceVisibilityScope
+from lfx.services.authorization.base import ResourceVisibilityScope, TargetedShareSelector
 from lfx.services.model_provider_policy import (
     ModelProviderPolicyContext,
     ModelProviderPolicyPurpose,
@@ -289,6 +290,50 @@ async def test_get_variable_resolves_scope_native_global_runtime_value(service, 
 
     with patch("langflow.services.deps.get_authorization_service", return_value=authz):
         result = await service.get_variable(actor_id, "GLOBAL_SHARED_TOKEN", "", session=session)
+
+    assert isinstance(result, SecretStr)
+    assert result.get_secret_value() == "shared-secret"
+    authz.get_resource_visibility.assert_awaited_once()
+    authz.list_visible_resource_ids.assert_not_awaited()
+
+
+async def test_get_variable_resolves_database_native_targeted_share(service, session: AsyncSession):
+    owner_id = uuid4()
+    actor_id = uuid4()
+    shared = await service.create_variable(
+        owner_id,
+        "TARGETED_SHARED_TOKEN",
+        "shared-secret",
+        type_=CREDENTIAL_TYPE,
+        session=session,
+    )
+    session.add(
+        AuthzShare(
+            resource_type="variable",
+            resource_id=shared.id,
+            scope="user",
+            target_id=actor_id,
+            permission_level="read",
+        )
+    )
+    await session.commit()
+
+    authz = MagicMock()
+    authz.is_enabled = AsyncMock(return_value=True)
+    authz.supports_cross_user_fetch = AsyncMock(return_value=True)
+    authz.get_resource_visibility = AsyncMock(
+        return_value=ResourceVisibilityScope(
+            targeted_share=TargetedShareSelector(
+                user_id=actor_id,
+                resource_type="variable",
+                permission_levels=("read", "write", "execute", "admin"),
+            )
+        )
+    )
+    authz.list_visible_resource_ids = AsyncMock(side_effect=AssertionError("legacy visibility hook used"))
+
+    with patch("langflow.services.deps.get_authorization_service", return_value=authz):
+        result = await service.get_variable(actor_id, "TARGETED_SHARED_TOKEN", "", session=session)
 
     assert isinstance(result, SecretStr)
     assert result.get_secret_value() == "shared-secret"

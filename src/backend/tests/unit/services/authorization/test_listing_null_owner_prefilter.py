@@ -31,11 +31,12 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+from langflow.services.database.models.auth import AuthzShare
 from langflow.services.database.models.flow.model import Flow
 from langflow.services.database.models.folder.model import Folder
 from langflow.services.database.models.user.model import User
 from langflow.services.deps import get_auth_service, get_settings_service, session_scope
-from lfx.services.authorization.base import BaseAuthorizationService, ResourceVisibilityScope
+from lfx.services.authorization.base import BaseAuthorizationService, ResourceVisibilityScope, TargetedShareSelector
 from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 from sqlalchemy.sql.sqltypes import NullType
 from sqlmodel import select
@@ -451,3 +452,41 @@ async def test_shared_project_get_does_not_delete_flows_hidden_from_response(cli
     async with session_scope() as session:
         persisted = set((await session.exec(select(Flow.id).where(Flow.folder_id == project_id))).all())
     assert persisted == {visible_id, hidden_id}
+
+
+async def test_shared_project_non_paginated_flow_list_evaluates_targeted_shares_in_database(client):
+    settings = get_settings_service()
+    username = f"recipient_{uuid4().hex}"
+    recipient_id = await _make_user(username)
+    owner_id = await _make_user(f"owner_{uuid4().hex}")
+    headers = await _login(client, username)
+    project_id = await _make_folder(f"shared_project_{uuid4().hex}", user_id=owner_id)
+    shared_id = await _make_flow(f"shared_{uuid4().hex}", user_id=owner_id, folder_id=project_id)
+    hidden_id = await _make_flow(f"hidden_{uuid4().hex}", user_id=owner_id, folder_id=project_id)
+    async with session_scope() as session:
+        session.add(
+            AuthzShare(
+                resource_type="flow",
+                resource_id=shared_id,
+                scope="user",
+                target_id=recipient_id,
+                permission_level="read",
+            )
+        )
+        await session.commit()
+
+    scope = ResourceVisibilityScope(
+        targeted_share=TargetedShareSelector(
+            user_id=recipient_id,
+            resource_type="flow",
+            permission_levels=("read", "write", "execute", "admin"),
+        )
+    )
+    with _install_prefilter_authz(settings, {}, scope_by_type={"flow": scope}):
+        response_ids = _project_flow_ids(
+            await client.get(f"api/v1/projects/{project_id}", headers=headers),
+            paginated=False,
+        )
+
+    assert response_ids == {shared_id}
+    assert hidden_id not in response_ids

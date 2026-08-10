@@ -6,13 +6,15 @@ from uuid import uuid4
 
 import pytest
 from langflow.services.authorization.listing import (
+    apply_owned_or_visible_scope_prefilter,
     resource_visible_in_scope,
     restrict_to_owned_or_visible_scope,
     visible_scope_prefilter,
 )
+from langflow.services.database.models.auth import AuthzShare, AuthzTeam, AuthzTeamMember
 from langflow.services.database.models.flow.model import Flow
 from langflow.services.database.models.folder.model import Folder
-from lfx.services.authorization.base import ResourceVisibilityScope
+from lfx.services.authorization.base import ResourceVisibilityScope, TargetedShareSelector
 from sqlmodel import select
 
 from ._common import _StubAuthorizationService, install_authz, install_settings
@@ -64,6 +66,25 @@ async def test_visible_scope_prefilter_adapts_legacy_concrete_id_service(monkeyp
     assert len(service.visible_calls) == 1
 
 
+@pytest.mark.anyio
+async def test_visible_scope_prefilter_returns_none_without_contacting_plugin_when_disabled(monkeypatch, fake_user):
+    install_settings(monkeypatch, authz_enabled=False)
+    scope = ResourceVisibilityScope(
+        targeted_share=TargetedShareSelector(
+            user_id=fake_user.id,
+            resource_type="flow",
+            permission_levels=("read",),
+        )
+    )
+    service = _ScopedAuthorizationService(scope)
+    install_authz(monkeypatch, service)
+
+    result = await visible_scope_prefilter(fake_user, resource_type="flow", act="read")
+
+    assert result is None
+    assert service.visible_calls == []
+
+
 def test_scope_predicate_unions_owner_explicit_workspace_and_project_grants():
     owner_id = uuid4()
     scope = ResourceVisibilityScope(
@@ -102,6 +123,194 @@ def test_global_scope_does_not_emit_an_unbounded_id_list():
     sql = str(constrained)
     assert "flow.id IN" not in sql
     assert "flow.user_id =" not in sql
+
+
+async def test_targeted_share_selector_uses_database_native_direct_and_active_team_predicates(async_session):
+    owner_id = uuid4()
+    target_user_id = uuid4()
+    other_user_id = uuid4()
+    active_team = AuthzTeam(team_name="Active", adom_name=f"active-{uuid4()}", is_active=True)
+    inactive_team = AuthzTeam(team_name="Inactive", adom_name=f"inactive-{uuid4()}", is_active=False)
+    owned = Flow(name="owned", user_id=owner_id)
+    direct_write = Flow(name="direct write", user_id=other_user_id)
+    direct_read = Flow(name="direct read", user_id=other_user_id)
+    active_team_admin = Flow(name="active team admin", user_id=other_user_id)
+    inactive_team_admin = Flow(name="inactive team admin", user_id=other_user_id)
+    wrong_resource_type = Flow(name="wrong resource type", user_id=other_user_id)
+    public_admin = Flow(name="public admin", user_id=other_user_id)
+    async_session.add_all(
+        [
+            active_team,
+            inactive_team,
+            owned,
+            direct_write,
+            direct_read,
+            active_team_admin,
+            inactive_team_admin,
+            wrong_resource_type,
+            public_admin,
+        ]
+    )
+    await async_session.flush()
+    async_session.add_all(
+        [
+            AuthzTeamMember(team_id=active_team.id, user_id=target_user_id),
+            AuthzTeamMember(team_id=inactive_team.id, user_id=target_user_id),
+            AuthzShare(
+                resource_type="flow",
+                resource_id=direct_write.id,
+                scope="user",
+                target_id=target_user_id,
+                permission_level="write",
+            ),
+            AuthzShare(
+                resource_type="flow",
+                resource_id=direct_read.id,
+                scope="user",
+                target_id=target_user_id,
+                permission_level="read",
+            ),
+            AuthzShare(
+                resource_type="flow",
+                resource_id=active_team_admin.id,
+                scope="team",
+                target_id=active_team.id,
+                permission_level="admin",
+            ),
+            AuthzShare(
+                resource_type="flow",
+                resource_id=inactive_team_admin.id,
+                scope="team",
+                target_id=inactive_team.id,
+                permission_level="admin",
+            ),
+            AuthzShare(
+                resource_type="deployment",
+                resource_id=wrong_resource_type.id,
+                scope="user",
+                target_id=target_user_id,
+                permission_level="admin",
+            ),
+            AuthzShare(
+                resource_type="flow",
+                resource_id=public_admin.id,
+                scope="public",
+                target_id=None,
+                permission_level="admin",
+            ),
+        ]
+    )
+    await async_session.commit()
+
+    visibility = ResourceVisibilityScope(
+        targeted_share=TargetedShareSelector(
+            user_id=target_user_id,
+            resource_type="flow",
+            # Enterprise maps WRITE to shares at WRITE or ADMIN level.
+            permission_levels=("write", "admin"),
+        )
+    )
+    stmt = restrict_to_owned_or_visible_scope(
+        select(Flow),
+        id_column=Flow.id,
+        owner_clause=Flow.user_id == owner_id,
+        visibility=visibility,
+    )
+    rows = list((await async_session.exec(stmt)).all())
+
+    assert {row.id for row in rows} == {owned.id, direct_write.id, active_team_admin.id}
+    sql = str(stmt)
+    assert "EXISTS" in sql
+    assert "authz_share.resource_id = flow.id" in sql
+    assert "flow.id IN" not in sql
+
+
+async def test_targeted_share_remains_additive_inside_reserved_global_project_exclusion(async_session):
+    owner_id = uuid4()
+    target_user_id = uuid4()
+    other_user_id = uuid4()
+    ordinary_project = Folder(name="ordinary")
+    reserved_project = Folder(name="reserved")
+    ordinary = Flow(name="ordinary", user_id=other_user_id, folder_id=ordinary_project.id)
+    hidden_reserved = Flow(name="hidden reserved", user_id=other_user_id, folder_id=reserved_project.id)
+    owned_reserved = Flow(name="owned reserved", user_id=owner_id, folder_id=reserved_project.id)
+    shared_reserved = Flow(name="shared reserved", user_id=other_user_id, folder_id=reserved_project.id)
+    async_session.add_all(
+        [ordinary_project, reserved_project, ordinary, hidden_reserved, owned_reserved, shared_reserved]
+    )
+    await async_session.flush()
+    async_session.add(
+        AuthzShare(
+            resource_type="flow",
+            resource_id=shared_reserved.id,
+            scope="user",
+            target_id=target_user_id,
+            permission_level="read",
+        )
+    )
+    await async_session.commit()
+
+    visibility = ResourceVisibilityScope(
+        all_resources=True,
+        excluded_global_project_ids=(reserved_project.id,),
+        targeted_share=TargetedShareSelector(
+            user_id=target_user_id,
+            resource_type="flow",
+            permission_levels=("read", "write", "execute", "admin"),
+        ),
+    )
+    stmt = restrict_to_owned_or_visible_scope(
+        select(Flow),
+        id_column=Flow.id,
+        owner_clause=Flow.user_id == owner_id,
+        project_column=Flow.folder_id,
+        visibility=visibility,
+    )
+    rows = list((await async_session.exec(stmt)).all())
+
+    assert {row.id for row in rows} == {ordinary.id, owned_reserved.id, shared_reserved.id}
+
+
+@pytest.mark.anyio
+async def test_targeted_share_selector_honors_scoped_api_key_owner_override(monkeypatch, async_session):
+    from langflow.services.authorization import listing as authz_listing
+
+    async def _override_off() -> bool:
+        return False
+
+    monkeypatch.setattr(authz_listing, "should_apply_owner_override", _override_off)
+    owner_id = uuid4()
+    target_user_id = uuid4()
+    owned = Flow(name="owned", user_id=owner_id)
+    shared = Flow(name="shared", user_id=uuid4())
+    async_session.add_all([owned, shared])
+    await async_session.flush()
+    async_session.add(
+        AuthzShare(
+            resource_type="flow",
+            resource_id=shared.id,
+            scope="user",
+            target_id=target_user_id,
+            permission_level="read",
+        )
+    )
+    await async_session.commit()
+
+    stmt = await apply_owned_or_visible_scope_prefilter(
+        select(Flow),
+        id_column=Flow.id,
+        owner_clause=Flow.user_id == owner_id,
+        visibility=ResourceVisibilityScope(
+            targeted_share=TargetedShareSelector(
+                user_id=target_user_id,
+                resource_type="flow",
+                permission_levels=("read",),
+            )
+        ),
+    )
+    rows = list((await async_session.exec(stmt)).all())
+
+    assert [row.id for row in rows] == [shared.id]
 
 
 async def test_global_scope_excludes_reserved_projects_but_keeps_owner_share_and_folderless(async_session):
