@@ -9,7 +9,6 @@ from lfx.log.logger import logger
 from lfx.services.mcp_composer.service import MCPComposerService
 from lfx.utils.util_strings import escape_like_pattern
 from sqlalchemy import literal, null, or_, update
-from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from langflow.api.utils import (
@@ -38,7 +37,6 @@ from langflow.services.authorization import (
     ProjectAction,
     ensure_project_permission,
     filter_visible_resources,
-    resource_visible_in_scope,
     restrict_to_owned_or_visible_scope,
     visible_scope_prefilter,
 )
@@ -326,7 +324,11 @@ async def read_project(
         # and widening the lookup would expose foreign projects without any
         # policy check.
         share_aware = await authz.supports_cross_user_fetch() and await authz.is_enabled()
-        stmt = select(Folder).options(selectinload(Folder.flows)).where(Folder.id == project_id)
+        # Fetch only the project row here. Flow rows are loaded below through
+        # the same explicit query used for pagination and authorization
+        # prefiltering. Eager-loading ``Folder.flows`` would materialize every
+        # flow before a targeted-share selector can narrow the result in SQL.
+        stmt = select(Folder).where(Folder.id == project_id)
         if not share_aware:
             stmt = stmt.where(Folder.user_id == current_user.id)
         project = (await session.exec(stmt)).first()
@@ -429,60 +431,49 @@ async def read_project(
 
             return FolderWithPaginatedFlows(folder=FolderRead.model_validate(project), flows=paginated_flows)
 
-        # If no pagination requested, return flows visible to the caller.
+        # If no pagination was requested, query the caller-visible flows once.
+        # Keeping this separate from the project fetch prevents a shared 10k
+        # project from being materialized before its compact scope or canonical
+        # share selector is evaluated by the database.
+        flow_stmt = select(Flow).where(Flow.folder_id == project_id)
         if treat_as_shared:
             # A project share grant implies access to the project itself, but
             # per-flow policy (deny rules, lower scopes) still applies. Without
-            # this, ``list(project.flows)`` would leak every flow in the project
+            # this, a broad project relationship load would leak every flow
             # regardless of finer-grained policy engine rules the plugin may
             # have. OSS pass-through returns the input list unchanged, so this
             # has no effect on default OSS installs.
             if visibility_scope is not None:
-                if visibility_scope.targeted_share is not None:
-                    # A targeted-share selector must be evaluated by the DB;
-                    # evaluating the already-loaded relationship would require
-                    # materializing every shared resource id in the plugin.
-                    stmt = restrict_to_owned_or_visible_scope(
-                        select(Flow).where(Flow.folder_id == project_id),
-                        id_column=Flow.id,
-                        owner_clause=Flow.user_id == current_user.id,
-                        workspace_expression=null() if project.workspace_id is None else literal(project.workspace_id),
-                        project_column=Flow.folder_id,
-                        visibility=visibility_scope,
-                    )
-                    visible_flows = list((await session.exec(stmt)).all())
-                else:
-                    # Other compact scopes can still filter the eager-loaded
-                    # relationship without another query or per-row enforce.
-                    visible_flows = [
-                        flow
-                        for flow in project.flows
-                        if flow.user_id == current_user.id
-                        or resource_visible_in_scope(
-                            resource_id=flow.id,
-                            workspace_id=project.workspace_id,
-                            project_id=flow.folder_id,
-                            visibility=visibility_scope,
-                        )
-                    ]
+                flow_stmt = restrict_to_owned_or_visible_scope(
+                    flow_stmt,
+                    id_column=Flow.id,
+                    owner_clause=Flow.user_id == current_user.id,
+                    workspace_expression=null() if project.workspace_id is None else literal(project.workspace_id),
+                    project_column=Flow.folder_id,
+                    visibility=visibility_scope,
+                )
+                visible_flows = list((await session.exec(flow_stmt)).all())
             else:
+                candidates = list((await session.exec(flow_stmt)).all())
                 visible_flows = await filter_visible_resources(
                     current_user,
                     resource_type="flow",
-                    candidates=list(project.flows),
+                    candidates=candidates,
                     domain_extractor=lambda flow: _resolve_authz_domain(project.workspace_id, flow.folder_id),
                     owner_extractor=lambda flow: flow.user_id,
                     act=FlowAction.READ,
                 )
         else:
-            visible_flows = [flow for flow in project.flows if flow.user_id == current_user.id]
+            visible_flows = list((await session.exec(flow_stmt.where(Flow.user_id == current_user.id))).all())
         # Convert without assigning the filtered list back to the ORM
         # relationship. ``Folder.flows`` owns delete-orphan cascade; mutating it
         # in this GET handler would delete every hidden flow when the request
         # session commits.
-        project_read = FolderReadWithFlows.model_validate(project, from_attributes=True)
-        project_read.flows = [FlowRead.model_validate(flow, from_attributes=True) for flow in visible_flows]
-        return project_read  # noqa: TRY300 - conversion must happen while the ORM session is active
+        project_fields = FolderRead.model_validate(project, from_attributes=True).model_dump()
+        return FolderReadWithFlows(
+            **project_fields,
+            flows=[FlowRead.model_validate(flow, from_attributes=True) for flow in visible_flows],
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
